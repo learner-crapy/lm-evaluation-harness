@@ -22,6 +22,8 @@ from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from lm_eval.utils import Collator, stop_sequences_criteria
 
+from transformers import AutoModelForCausalLM
+
 
 eval_logger = utils.eval_logger
 
@@ -714,6 +716,22 @@ class HFLM(LM):
                 assert self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
                 return self.model(inps).logits
 
+            # model(input):
+            # 这是一般的模型推理方法，它接受输入张量input并返回模型的原始输出。
+            # 输出通常是包含对下一单词或符号的预测得分的张量，不会生成完整的文本序列。
+            # 您需要进一步处理这些得分，例如使用softmax
+            # 函数将其转换为概率分布，然后选择最高概率的下一个标记作为生成的标记。
+
+            # model.generate(input):
+            # 这是一个用于文本生成的高级方法，它接受输入张量input并自动处理文本生成的细节。
+            # 它使用自回归（auto - regressive）的方式，从给定的输入开始生成文本序列，一次一个标记。
+            # 您可以使用参数来控制生成的文本长度、生成的文本数量等。
+            # 所以，关键区别在于
+            # model.generate(input)更适合文本生成任务，它会自动处理生成过程，而model(input)
+            # 只提供模型的原始输出，需要额外的逻辑来生成文本序列。如果您想使用模型生成文本，通常更方便使用
+            # model.generate(input)
+
+
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         # temperature = 0.0 if not set
         # if do_sample is false and temp==0.0:
@@ -743,6 +761,9 @@ class HFLM(LM):
             ), "Must pass input len and cont. len to select scored logits for causal LM"
             # discard right-padding.
             # also discard the input/context tokens. we'll only score continuations.
+            # 这个函数_select_cont_toks是设计来从一个模型输出的logits中选择特定的token预测分数，
+            # 用于后续处理或评估。它根据不同的模型类型采取不同的策略来选择logits。这里的logits通常
+            # 指模型为每个可能的下一个token输出的原始得分，这些得分还没有被转换为概率分布
             logits = logits[inplen - contlen : inplen]
         elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
             assert (
@@ -751,7 +772,17 @@ class HFLM(LM):
             # only discard right-padding.
             # the logits input to this fn only contain decoder-side tokens.
             logits = logits[:contlen]
+            # 对于因果语言模型(AutoModelForCausalLM):
+            # 这种模型类型处理连续的文本，其中续写直接跟随上下文。因此，需要知道上下文的长度（inplen）和续写的长度（contlen）来准确选取续写部分的logits。
+            # 函数通过logits[inplen - contlen: inplen]
+            # 选择续写部分，即从上下文末尾开始到续写末尾的区域。这里假设logits已经包含了整个输入序列的评分，包括上下文和续写。
+            # 对于序列到序列模型(AutoModelForSeq2SeqLM):
+            # 这类模型通常将输入序列（源序列）和输出序列（目标序列，即续写）分开处理。因此，logits通常只代表对输出序列的评分。
+            # 在这种情况下，只需要续写的长度（contlen），通过logits[:contlen]
+            # 选取从序列开始到续写长度的部分。这里不需要inplen，因为logits已经假定只包含了对目标序列的评分。
 
+            # （Causal Language Model）。这类模型通常用于文本生成任务，如故事生成、对话系统、内容补全等。它们被称为“因果”模型，因为生成的文本是基于给定上下文顺序产生的，即模型在生成每个新词时，只考虑之前的词（而不是整个序列）。
+            # Seq2Seq模型主要用于处理那些需要将输入序列转换成输出序列的任务，例如机器翻译（从一种语言翻译到另一种语言）、文本摘要（将长文本压缩成短文本）、问答系统（将问题转换成答案）等。
         return logits
 
     def _encode_pair(
@@ -859,6 +890,144 @@ class HFLM(LM):
         self.batch_sizes[sched] = self._detect_batch_size(n_reordered_requests, pos)
         print(f"Determined largest batch size: {self.batch_sizes[sched]}")
         return self.batch_sizes[sched]
+
+    def __loglikelihood_tokens_medical(
+        self,
+        requests: List[Tuple[Tuple[str, str], List[int], List[int]]],
+        disable_tqdm: bool = False,
+        override_bs: int = None,
+    ) -> List[Tuple[float, bool]]:
+        # TODO: implement some kind of efficient-request-middleware that lumps together requests with the same context
+        res = []
+        def _collate(x):
+            """Defines the key for the sorted method"""
+            # the negative sign on len(toks) sorts descending - this has a few advantages:
+            # - time estimates will always be over not underestimates, which is more useful for planning
+            # - to know the size of a batch when going through the list, you know the first one is always the batch
+            #   padded context length. this is useful to simplify the batching logic and more importantly to make
+            #   automatic adaptive batches much much easier to implement
+            # - any OOMs will happen right away rather than near the end
+
+            toks = x[1] + x[2]
+            return -len(toks), tuple(toks)
+
+        re_ord = Collator(requests, sort_fn=_collate)
+        # automatic (variable) batch size detection for vectorization
+        # pull longest context sample from request
+        n_reordered_requests = len(re_ord)
+        batch_size = (
+            self.batch_size
+            if self.batch_size != "auto"
+            else override_bs
+            if override_bs is not None
+            else 0
+        )
+        batch_fn = (
+            self._batch_scheduler
+            if self.batch_size == "auto"
+            and n_reordered_requests > 0
+            and not override_bs
+            else None
+        )
+
+        chunks = re_ord.get_batched(n=batch_size, batch_fn=batch_fn)
+        pbar = tqdm(total=len(requests), disable=(disable_tqdm or (self.rank != 0)))
+        for chunk in chunks:
+            inps = []
+            cont_toks_list = []
+            inplens = []
+
+            conts = []
+            encoder_attns = []
+
+            padding_len_inp = None
+            padding_len_cont = None
+            # because vectorizing is annoying, we first convert each (context, continuation) pair to padded
+            # tensors, then we pack them together into a batch, call the model, and then pick it all apart
+            # again because vectorizing is annoying
+
+            for _, context_enc, continuation_enc in chunk:
+                # sanity check
+                assert len(context_enc) > 0
+                assert len(continuation_enc) > 0
+                assert len(continuation_enc) <= self.max_length
+
+                # how this all works (illustrated on a causal decoder-only setup):
+                #          CTX      CONT
+                # inp    0 1 2 3|4 5 6 7 8 9   <- last token is deleted by inp[:, :-1]
+                # model  \               \
+                # logits   1 2 3|4 5 6 7 8 9   <- the ctx half gets tossed out by the
+                # cont_toks      4 5 6 7 8 9      [:, -len(continuation_enc):, :self.vocab_size] slice
+
+                # when too long to fit in context, truncate from the left
+                if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+                    inp = torch.tensor(
+                        (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    (inplen,) = inp.shape
+                elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+                    inp = torch.tensor(
+                        (context_enc)[-self.max_length :],
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    (inplen,) = inp.shape
+
+                    # build encoder attn masks
+                    encoder_attns.append(torch.ones_like(inp))
+
+                    cont = torch.tensor(
+                        (continuation_enc)[-self.max_length :],
+                        # TODO: left-shift these?
+                        # TODO: our code assumes we never end up truncating conts for either model type
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    (contlen,) = cont.shape
+
+                    conts.append(cont)
+
+                    padding_len_cont = (
+                        max(padding_len_cont, contlen)
+                        if padding_len_cont is not None
+                        else contlen
+                    )
+
+                padding_len_inp = (
+                    max(padding_len_inp, inplen)
+                    if padding_len_inp is not None
+                    else inplen
+                )
+
+                inps.append(inp)  # [1, inp_length]
+                cont_toks_list.append(continuation_enc)
+                inplens.append(inplen)
+
+            # create encoder attn mask and batched conts, if seq2seq
+            call_kwargs = {}
+            if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+                batched_inps = utils.pad_and_concat(
+                    padding_len_inp, inps, padding_side="right"
+                )  # [batch, padding_len_inp]
+            elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+                # TODO: left-pad encoder inps and mask?
+                batched_inps = utils.pad_and_concat(
+                    padding_len_inp, inps
+                )  # [batch, padding_len_inp]
+                batched_conts = utils.pad_and_concat(
+                    padding_len_cont, conts
+                )  # [batch, padding_len_cont]
+                batched_encoder_mask = utils.pad_and_concat(
+                    padding_len_inp, encoder_attns
+                )  # [batch, padding_len_inp]
+                call_kwargs = {
+                    "attn_mask": batched_encoder_mask,
+                    "labels": batched_conts,
+                }
+
+
 
     def _loglikelihood_tokens(
         self,
@@ -1011,6 +1180,7 @@ class HFLM(LM):
                 # (discard context toks if decoder-only ; discard right-padding)
                 # also discards + checks for "virtual tokens" in the causal LM's input window
                 # from prompt/prefix tuning tokens, if applicable
+
                 ctx_len = (
                     inplen + (logits.shape[0] - padding_len_inp)
                     if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM

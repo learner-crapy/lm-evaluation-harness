@@ -1,0 +1,20 @@
+task: med_cqa
+dataset_path: daze-unlv/medmcqa
+dataset_name: null
+output_type: multiple_choice
+training_split: train
+validation_split: validation
+doc_to_text: "This is a real-world medical entrance exam question, please select the true answer from the options: \n{{question}}\nA: {{opa}}, B: {{opb}}, C: {{opc}}, D: {{opd}}\nwhat is the true answer？please select among [A, B, C, D], only A or B or C or D, not more other content.\n\nanswer:"
+target_delimiter: " "
+doc_to_choice:
+  - "A"
+  - "B"
+  - "C"
+  - "D"
+doc_to_target: "{{ (cop|int) }}"
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 0.0
